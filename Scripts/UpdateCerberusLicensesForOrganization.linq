@@ -10,12 +10,12 @@
   <Namespace>System.Net.Http</Namespace>
   <Namespace>System.Threading.Tasks</Namespace>
   <Namespace>System.Net.Http.Json</Namespace>
+  <Namespace>System.Net</Namespace>
 </Query>
 
 // Cerberus API info
-public static string _cerberusUrl = "https://cerberus-core.azurewebsites.net";
-//public static string _productApiBase = "https://app-daltonsightapi-prod-scu.azurewebsites.net";
-public static bool IsDryRun = true;
+public static string _cerberusUrl = "https://localhost:7118"; 
+public static bool IsDryRun = false;
 
 // GET API endpoints
 public static Func<HttpClient, string, Task<User>> GetUserByEmailAddress = GetRequestAsync<User>(_cerberusUrl, email => $"user/{email}");
@@ -26,46 +26,56 @@ public static Func<HttpClient, string, Task<List<LicenseAssignmentRequest>>> Get
 
 // POST API endpoints
 public static async Task<AddOrganizationLicenseAssignmentCommand> AddOrganizationLicenseAssignment(string organizationId, string licenseId, int requestedLength, HttpClient client) =>
-	await SendRequestAsync(new AddOrganizationLicenseAssignmentCommand(organizationId, licenseId, requestedLength), _cerberusUrl, $"organization/{organizationId}/license/{licenseId},", client);
+	await SendRequestAsync(new AddOrganizationLicenseAssignmentCommand(organizationId, licenseId, requestedLength), _cerberusUrl, $"organization/{organizationId}/license/{licenseId}", client);
 
 public static async Task<AddOrganizationLicenseApprovalCommand> AddOrganizationLicenseApproval(string organizationId, string licenseAssignmentRequestId, DateTime expiration, HttpClient client) =>
-	await SendRequestAsync(new AddOrganizationLicenseApprovalCommand(organizationId, licenseAssignmentRequestId, expiration), _cerberusUrl, $"organization/{organizationId}/license/{licenseAssignmentRequestId},", client);
+	await SendRequestAsync(new AddOrganizationLicenseApprovalCommand(organizationId, licenseAssignmentRequestId, expiration), _cerberusUrl, $"organization/{organizationId}/license/{licenseAssignmentRequestId}/approve", client);
 
-//public async Task<LicenseAssignmentDeactivation> DeactivateLicenseAssignment(DeactivateLicenseRequest request, string organizationId, string licenseAssignmentRequestId, CancellationToken cancellationToken) =>
-//	await SendRequestAsync(licenseAssignmentRequestId, organizationId, request.DeactivationReason, request.Reason, cancellationToken);
+public static async Task<LicenseAssignmentDeactivation> DeactivateLicenseAssignment(DeactivateLicenseRequest request, string organizationId, string licenseAssignmentRequestId, HttpClient client) =>
+	await SendRequestAsync(new LicenseAssignmentDeactivation(licenseAssignmentRequestId, DateTime.Now, "test-user", request.DeactivationReason, request.Reason), _cerberusUrl, $"organization/{organizationId}/license/{licenseAssignmentRequestId}/deactivate", client);
 
-// test endpoint; maybe not needed
-public static Func<HttpClient, string, Task<LicenseAutoApproveDetails>> GetLicenseAutoApproveDetails = GetRequestAsync<LicenseAutoApproveDetails>(_cerberusUrl, licenseId => $"license/{licenseId}/auto-approve");
+// test for adding product
+//public static async Task<AddProductCommand> AddProduct(string id, string name, string description, HttpClient client) =>
+//	await SendRequestAsync(new AddProductCommand(id, id, name, description, ""), _cerberusUrl, "product", client);
 
 async Task Main()
 {
 	var client = new HttpClient();
+	var oldRadiusLicense = "02b8de85-6a50-4cf9-9c87-0b44aba3797b"; // "eb858314-fc5f-4f2a-b03c-6b98df631d44";
 	
 	// Get the list of current organizations
 	var organizations = await GetOrganizations(client);
 
 	foreach (var org in organizations)
 	{
+		var hasOldRadiusLicense = false;
+		var licenseExpiration = DateTime.Now;
+		var licenseAssignmentRequestId = "";
+		
 		try
 		{
 			var organizationLicenseAssignments = await GetLicenseAssignmentsForAnOrganization(client, org.Id);
 			
-			// should only be one (or none) as an organization can only have one license at a time
-			var licenseIdForOrganization = organizationLicenseAssignments.FirstOrDefault();
-			if (licenseIdForOrganization != null)
+			if (organizationLicenseAssignments != null)
 			{
-				var licenseApprovalId = licenseIdForOrganization.LicenseId;
-							
-				// base-radius licenseId is eb858314-fc5f-4f2a-b03c-6b98df631d44
-				// and its product id is c59b55b6-25e8-46d4-87b0-ea7374493036
-				// according to what shows in table storage
-				
-				var testLicenseIdApproval = await GetLicenseAutoApproveDetails(client, licenseApprovalId);			
-				// need to query to determine what license is assigned to org but no known endpoint...
+				foreach (var license in organizationLicenseAssignments)
+				{
+					// the old base radius licenseId is eb858314-fc5f-4f2a-b03c-6b98df631d44
+					// if it exists under this org, we need to make note for it to be reassigned
+					if (license.LicenseId == oldRadiusLicense)
+					{
+						hasOldRadiusLicense = true;
+						
+						// Keep track of this licenses expiration and assignment id
+						licenseExpiration = license.Expiration;
+						licenseAssignmentRequestId = license.LicenseAssignmentRequestId;
+					}
+				}
 			}
 			
 			// reassign the license here
-			await ReassignRadiusLicense("pass_in_org_id_for_now");
+			if (hasOldRadiusLicense)
+				await ReassignRadiusLicense(org.Id, licenseAssignmentRequestId, licenseExpiration, client);
 		}
 		catch (Exception ex)
 		{
@@ -74,13 +84,31 @@ async Task Main()
 	}
 }
 
-public static async Task ReassignRadiusLicense(string organizationId)
+/// <summary>
+/// Reassigns one license from an organization to another license
+/// </summary>
+public static async Task ReassignRadiusLicense(string organizationId, string licenseAssignmentRequestId, DateTime licenseExpiration, HttpClient client)
 {
+	var newRadiusLicense = "3dc17cbd-0b9a-486b-ae11-83db3b61ff60";
+	
 	// call DeactivateLicenseAssignment to remove existing Radius license
+	var deactivationResult = await DeactivateLicenseAssignment(new DeactivateLicenseRequest(DeactivationReason.Revoked, "Moving to the new Radius license"), organizationId, licenseAssignmentRequestId, client);
 
 	// call AddOrganizationLicenseAssignment to begin assignment of new Radius license
+	var organizationAssignmentResult = await AddOrganizationLicenseAssignment(organizationId, newRadiusLicense, 0, client);
 	
-	// call AddOrganizationLicenseAssignment to approve the license
+	// need to get the newly created license assignment request
+	var organizationLicenseAssignmentRequests = await GetLicenseRequestsForAnOrganization(client, organizationId);
+	
+	// filter out license requests for this organization that are not related
+	var pendingLicenseAssignment = organizationLicenseAssignmentRequests
+		.Where(x => x.State == LicenseAssignmentRequestState.PendingApproval && x.LicenseId == newRadiusLicense);
+
+	// call AddOrganizationLicenseAssignment to approve the license(s)
+	foreach (var pendingAdd in pendingLicenseAssignment)
+	{
+		var organizationApprovalResult = await AddOrganizationLicenseApproval(organizationId, pendingAdd.Id, licenseExpiration, client);
+	}
 }
 
 /// <summary>
@@ -91,7 +119,7 @@ public static Func<HttpClient, Task<TResponse>> GetRequestAsync<TResponse>(strin
 	var uri = new Uri(new Uri(baseUrl), route).Dump("Uri");
 	var request = new HttpRequestMessage(HttpMethod.Get, $"{baseUrl}/{route}");
 
-	request.Headers.Add("x-user-id", "RadiusLicensingLinq"); // does the specific name matter?
+	request.Headers.Add("x-user-id", "UpdateLicensesLinq");
 
 	var response = await client.SendAsync(request);
 
@@ -121,7 +149,7 @@ public static async Task<T> SendRequestAsync<T>(T content, string baseUrl, strin
 	var request = new HttpRequestMessage(HttpMethod.Post, uri.Dump());
 
 	request.Content = JsonContent.Create(content);
-	request.Headers.Add("x-user-id", "RadiusLicensingLinq"); // does the specific name matter?
+	request.Headers.Add("x-user-id", "RadiusLicensingLinq");
 
 	try
 	{
@@ -158,7 +186,7 @@ public static async Task<TResponse> SendRequestAsync<TRequest, TResponse>(TReque
 	var request = new HttpRequestMessage(HttpMethod.Post, uri);
 
 	request.Content = JsonContent.Create(content);
-	request.Headers.Add("x-user-id", "RadiusLicensingLinq"); // does the specific name matter?
+	request.Headers.Add("x-user-id", "UpdateLicensesLinq");
 
 	var response = await client.SendAsync(request);
 
@@ -181,6 +209,15 @@ public enum DeactivationReason
 	DemoComplete
 }
 
+public enum LicenseAssignmentRequestState
+{
+    Unknown,
+    PendingApproval,
+    Approved,
+    Denied,
+    Deactivated
+}
+
 // Data models
 
 // GET
@@ -191,12 +228,9 @@ public record Organization(string Id, string Name, string EmailDomain, string Ex
 
 public record LicenseAssignment(string LicenseAssignmentRequestId, string LicenseId, string OrganizationId, DateTime Expiration);
 
-public record LicenseAssignmentRequest(string Id, string LicenseId, string OrganizationId, int RequestedLength, string RequestedBy, DateTime Requested);
+public record LicenseAssignmentRequest(string Id, string LicenseId, string OrganizationId, int RequestedLength, string RequestedBy, DateTime Requested, LicenseAssignmentRequestState State);
 
 public record License(string Id, string Title, string Description, string ExternalId, string ProductId, int DefaultLicenseLength);
-
-// probably test only; delete later
-public record LicenseAutoApproveDetails(string LicenseId, int AutoApproveLimit, DateTime AutoApproveEnabled, string AutoApproveEnabledBy);
 
 // POST
 
